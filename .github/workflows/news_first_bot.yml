@@ -2,7 +2,7 @@ name: News First Bot
 
 on:
   schedule:
-    # Toutes les 15 minutes, pour capter les publications au plus près
+    - cron: "0 5 * * *"
     - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
