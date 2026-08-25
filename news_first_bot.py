@@ -77,13 +77,32 @@ STATE_FILE = "state/sent_events.json"
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-_seuil_raw = os.environ.get("SEUIL_ALERTE", "").strip()
-SEUIL_ALERTE = int(_seuil_raw) if _seuil_raw else 5
 
-PUBLISH_WINDOW_MIN = 20   # tolérance pour détecter "vient de sortir"
-WATCH_HOURS = 36          # fenêtre d'anticipation avant publication
+RUN_MODE = os.environ.get("RUN_MODE", "briefing").strip().lower()  # "briefing" ou "watch"
+
+PUBLISH_WINDOW_MIN = 20
+WATCH_HOURS = 36
 
 
+def env_int(name, default):
+    val = os.environ.get(name, "")
+    if val is None or str(val).strip() == "":
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
+def env_bool(name, default):
+    val = os.environ.get(name, "")
+    if val is None or str(val).strip() == "":
+        return default
+    return str(val).strip().lower() == "true"
+
+
+SEUIL_ALERTE = env_int("SEUIL_ALERTE", 5)
+ENVOYER_MEME_SANS_ALERTE = env_bool("ENVOYER_MEME_SANS_ALERTE", True)
 # ---------------------------------------------------------------
 # RÉCUPÉRATION ET PARSING
 # ---------------------------------------------------------------
@@ -303,9 +322,8 @@ def load_state():
     try:
         with open(STATE_FILE, "r") as f:
             return json.load(f)
-    except Exception:
-        return {"alerted": []}
-
+      except Exception:
+        return {"alerted": [], "last_briefing_date": ""}
 
 def save_state(state):
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
@@ -356,8 +374,7 @@ def build_daily_briefing(events):
     fortes = {d: s for d, s in scores.items() if abs(s) >= SEUIL_ALERTE}
     faibles = {d: s for d, s in scores.items() if abs(s) < SEUIL_ALERTE}
 
-    lines = []
-    alerte_declenchee = len(fortes) > 0
+        lines = []
 
     if fortes:
         lines.append(f"<b>🔴 BIAIS FORT (seuil {SEUIL_ALERTE} dépassé)</b>")
@@ -391,7 +408,7 @@ def build_daily_briefing(events):
             lines.append(format_scenario_table(table))
             lines.append(f"Actifs à surveiller: {', '.join(ASSET_MAP.get(e['devise'], ['-']))}")
 
-    return "\n".join(lines), alerte_declenchee
+     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------
@@ -399,10 +416,12 @@ def build_daily_briefing(events):
 # ---------------------------------------------------------------
 
 def main():
+    print(f"Mode d'exécution : {RUN_MODE}")
     print("Récupération du calendrier économique...")
     raw = fetch_calendar()
     if not raw:
-        send_telegram("Bot news-first: impossible de récupérer le calendrier aujourd'hui.")
+        if RUN_MODE == "briefing":
+            send_telegram("Bot news-first: impossible de récupérer le calendrier aujourd'hui.")
         return
 
     events = parse_events(raw)
@@ -415,14 +434,18 @@ def main():
         send_telegram(msg)
         state.setdefault("alerted", []).append(e["id"])
 
-    briefing, alerte = build_daily_briefing(events)
-    print(briefing)
-
-    envoyer_toujours = os.environ.get("ENVOYER_MEME_SANS_ALERTE", "true").lower() == "true"
-    if not fresh and (alerte or envoyer_toujours):
-        send_telegram(briefing)
-    elif not fresh:
-        print("Aucun biais fort détecté et pas de publication fraîche — briefing non envoyé.")
+    if RUN_MODE == "briefing":
+        today_str = datetime.now(TZ).strftime("%Y-%m-%d")
+        if state.get("last_briefing_date") == today_str:
+            print("Briefing déjà envoyé aujourd'hui.")
+        else:
+            briefing = build_daily_briefing(events)
+            print(briefing)
+            if ENVOYER_MEME_SANS_ALERTE or "🔴" in briefing:
+                send_telegram(briefing)
+            state["last_briefing_date"] = today_str
+    else:
+        print("Mode watch : pas de briefing complet.")
 
     save_state(state)
 
