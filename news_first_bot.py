@@ -322,7 +322,7 @@ def load_state():
     try:
         with open(STATE_FILE, "r") as f:
             return json.load(f)
-      except Exception:
+         except Exception:
         return {"alerted": [], "last_briefing_date": ""}
 
 def save_state(state):
