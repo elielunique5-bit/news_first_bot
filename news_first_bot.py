@@ -77,7 +77,8 @@ STATE_FILE = "state/sent_events.json"
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-SEUIL_ALERTE = int(os.environ.get("SEUIL_ALERTE", "5"))
+_seuil_raw = os.environ.get("SEUIL_ALERTE", "").strip()
+SEUIL_ALERTE = int(_seuil_raw) if _seuil_raw else 5
 
 PUBLISH_WINDOW_MIN = 20   # tolérance pour détecter "vient de sortir"
 WATCH_HOURS = 36          # fenêtre d'anticipation avant publication
