@@ -1,25 +1,25 @@
-
 """
-Bot d'analyse des annonces économiques - Stratégie news-first (v2)
+Bot d'analyse des annonces économiques - Stratégie news-first (v3)
 ====================================================================
-Nouveautés vs v1 :
-  - Fuseau horaire corrigé : toutes les heures affichées sont converties
-    en heure de Kinshasa (Africa/Kinshasa), quelle que soit la source.
-  - Tableaux de scénarios automatiques (consensus / confirmation forte /
-    surprise inverse) générés à partir de forecast vs previous, SANS
-    intégrer de thèse personnelle - c'est un cadre neutre à interpréter.
-  - Détection de publication : si un event vient de sortir (actual
-    rempli) dans la fenêtre de tolérance, alerte dédiée avec le
-    scénario réalisé + les actifs concrètement ciblés.
-  - Avant publication : liste des actifs à surveiller.
-  - Mémoire d'état (state/sent_events.json) pour ne pas ré-alerter deux
-    fois le même event - committée dans le repo par le workflow.
+- Fuseau horaire : TOUTES les heures affichées sont converties en
+  heure de Kinshasa (Africa/Kinshasa), quelle que soit la source du feed.
+- SEUIL_ALERTE : lecture protégée (env_int), ne plante plus si la
+  variable GitHub est vide ou absente.
+- Deux modes d'exécution, pilotés par RUN_MODE (fixé par le workflow) :
+    RUN_MODE=briefing -> envoie le récap complet du biais cumulé
+                          (normalement 1x/jour, ~6h Kinshasa)
+    RUN_MODE=watch     -> ne fait QUE vérifier les publications fraîches
+                          (tourne toutes les 15 min, pas de spam)
+- Anti-doublon :
+    - state["alerted"]           -> events déjà notifiés individuellement
+    - state["last_briefing_date"] -> empêche d'envoyer 2 briefings le même jour
+      même si le cron se déclenche deux fois ou qu'on relance manuellement.
 
 Secrets requis dans le repo GitHub :
     TELEGRAM_BOT_TOKEN
     TELEGRAM_CHAT_ID
 
-Variables optionnelles :
+Variables optionnelles (Settings > Secrets and variables > Actions > Variables) :
     SEUIL_ALERTE (def: 5)
     ENVOYER_MEME_SANS_ALERTE (def: true)
 """
@@ -35,8 +35,8 @@ from zoneinfo import ZoneInfo
 # CONFIGURATION
 # ---------------------------------------------------------------
 
-TZ = ZoneInfo("Africa/Kinshasa")          # fuseau d'affichage cible
-SOURCE_TZ_FALLBACK = ZoneInfo("America/New_York")  # fuseau du feed si pas d'offset explicite
+TZ = ZoneInfo("Africa/Kinshasa")                    # fuseau d'affichage cible
+SOURCE_TZ_FALLBACK = ZoneInfo("America/New_York")   # fuseau du feed si pas d'offset explicite
 
 MARKETS = {
     "USD": "New York",
@@ -80,11 +80,12 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 RUN_MODE = os.environ.get("RUN_MODE", "briefing").strip().lower()  # "briefing" ou "watch"
 
-PUBLISH_WINDOW_MIN = 20
-WATCH_HOURS = 36
+PUBLISH_WINDOW_MIN = 20   # tolérance pour détecter "vient de sortir"
+WATCH_HOURS = 36          # fenêtre d'anticipation avant publication
 
 
 def env_int(name, default):
+    """Lit une variable d'env entière, en gérant le cas vide/absent (bug corrigé)."""
     val = os.environ.get(name, "")
     if val is None or str(val).strip() == "":
         return default
@@ -103,6 +104,8 @@ def env_bool(name, default):
 
 SEUIL_ALERTE = env_int("SEUIL_ALERTE", 5)
 ENVOYER_MEME_SANS_ALERTE = env_bool("ENVOYER_MEME_SANS_ALERTE", True)
+
+
 # ---------------------------------------------------------------
 # RÉCUPÉRATION ET PARSING
 # ---------------------------------------------------------------
@@ -174,7 +177,7 @@ def parse_events(raw_events):
         if niveau is None:
             niveau = 2
 
-        dt = parse_datetime(e.get("date", ""))
+        dt = parse_datetime(e.get("date", ""))  # <- toujours en heure Kinshasa
 
         parsed.append({
             "id": f"{currency}_{title}_{e.get('date','')}",
@@ -195,13 +198,6 @@ def parse_events(raw_events):
 # ---------------------------------------------------------------
 
 def build_scenario_table(event):
-    """
-    Génère 3 scénarios neutres à partir de forecast vs previous :
-      1) Conforme au consensus
-      2) Confirmation forte (au-delà du consensus, dans le sens de la tendance)
-      3) Surprise inverse (retour vers ou au-delà du previous)
-    Retourne None si les valeurs ne sont pas numériques (ex: événements qualitatifs).
-    """
     f, p = parse_num(event["forecast"]), parse_num(event["previous"])
     if f is None or p is None:
         return None
@@ -217,23 +213,15 @@ def build_scenario_table(event):
         forte = f - step * 0.5
         inverse = p + step * 0.3
 
-    return {
-        "trend_up": trend_up,
-        "consensus": f,
-        "forte": forte,
-        "inverse": inverse,
-    }
+    return {"trend_up": trend_up, "consensus": f, "forte": forte, "inverse": inverse}
 
 
 def classify_actual(event, table):
-    """Une fois l'actual connu, indique quel scénario s'est réalisé."""
     a = parse_num(event["actual"])
     if a is None or table is None:
         return None
-
     f = table["consensus"]
-    tol = max(abs(f) * 0.08, 0.05)  # tolérance ~8% ou 0.05 point
-
+    tol = max(abs(f) * 0.08, 0.05)
     if abs(a - f) <= tol:
         return "Conforme au consensus"
     if (table["trend_up"] and a > f) or (not table["trend_up"] and a < f):
@@ -247,12 +235,11 @@ def format_scenario_table(table, unite=""):
     if table is None:
         return "  (pas de scénario chiffré disponible pour cet event)"
     fleche = "↑" if table["trend_up"] else "↓"
-    lignes = [
+    return "\n".join([
         f"  1) Conforme au consensus     : ~{table['consensus']:.2f}{unite}",
         f"  2) Confirmation forte {fleche}      : au-delà de {table['forte']:.2f}{unite}",
         f"  3) Surprise inverse           : retour vers/au-delà de {table['inverse']:.2f}{unite}",
-    ]
-    return "\n".join(lignes)
+    ])
 
 
 # ---------------------------------------------------------------
@@ -300,7 +287,7 @@ def upcoming_events(events, hours_ahead=WATCH_HOURS):
 
 
 def just_published(events, state, window_min=PUBLISH_WINDOW_MIN):
-    """Events dont l'actual est rempli, publiés récemment, pas encore alertés."""
+    """Events dont l'actual est rempli, pas encore alertés."""
     now = datetime.now(TZ)
     fresh = []
     for e in events:
@@ -315,15 +302,16 @@ def just_published(events, state, window_min=PUBLISH_WINDOW_MIN):
 
 
 # ---------------------------------------------------------------
-# ÉTAT (pour éviter les alertes en double)
+# ÉTAT (anti-doublon : publications individuelles + briefing quotidien)
 # ---------------------------------------------------------------
 
 def load_state():
     try:
         with open(STATE_FILE, "r") as f:
             return json.load(f)
-         except Exception:
+    except Exception:
         return {"alerted": [], "last_briefing_date": ""}
+
 
 def save_state(state):
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
@@ -374,8 +362,7 @@ def build_daily_briefing(events):
     fortes = {d: s for d, s in scores.items() if abs(s) >= SEUIL_ALERTE}
     faibles = {d: s for d, s in scores.items() if abs(s) < SEUIL_ALERTE}
 
-        lines = []
-
+    lines = []
     if fortes:
         lines.append(f"<b>🔴 BIAIS FORT (seuil {SEUIL_ALERTE} dépassé)</b>")
         for devise, score in sorted(fortes.items(), key=lambda x: -abs(x[1])):
@@ -408,7 +395,7 @@ def build_daily_briefing(events):
             lines.append(format_scenario_table(table))
             lines.append(f"Actifs à surveiller: {', '.join(ASSET_MAP.get(e['devise'], ['-']))}")
 
-     return "\n".join(lines)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------
@@ -437,7 +424,7 @@ def main():
     if RUN_MODE == "briefing":
         today_str = datetime.now(TZ).strftime("%Y-%m-%d")
         if state.get("last_briefing_date") == today_str:
-            print("Briefing déjà envoyé aujourd'hui.")
+            print("Briefing déjà envoyé aujourd'hui — on ne renvoie pas de doublon.")
         else:
             briefing = build_daily_briefing(events)
             print(briefing)
@@ -445,7 +432,7 @@ def main():
                 send_telegram(briefing)
             state["last_briefing_date"] = today_str
     else:
-        print("Mode watch : pas de briefing complet.")
+        print("Mode watch : pas de briefing complet, uniquement les publications fraîches ci-dessus.")
 
     save_state(state)
 
