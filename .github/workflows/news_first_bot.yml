@@ -1,9 +1,10 @@
 name: News First Bot
 
 on:
-  schedule:
-    - cron: "0 5 * * *"
-    - cron: "*/15 * * * *"
+    schedule:
+    - cron: "3 5 * * *"
+    - cron: "7,22,37,52 * * * *"
+   
   workflow_dispatch: {}
 
 permissions:
