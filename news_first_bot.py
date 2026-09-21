@@ -26,6 +26,7 @@ Variables optionnelles (Settings > Secrets and variables > Actions > Variables) 
 
 import os
 import json
+import time
 import requests
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -111,14 +112,28 @@ ENVOYER_MEME_SANS_ALERTE = env_bool("ENVOYER_MEME_SANS_ALERTE", True)
 # ---------------------------------------------------------------
 
 def fetch_calendar():
-    try:
-        resp = requests.get(FOREX_FACTORY_URL, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        print(f"Erreur de récupération du calendrier: {e}")
-        return []
-
+    """Récupère le calendrier, avec 1 retry et détection des blocages (HTML au lieu de JSON)."""
+    for tentative in range(2):
+        try:
+            resp = requests.get(FOREX_FACTORY_URL, timeout=10)
+            resp.raise_for_status()
+            text_preview = resp.text[:200].strip()
+            if text_preview.startswith(("<!DOCTYPE", "<html", "<HTML")):
+                print(f"Réponse non-JSON reçue (tentative {tentative+1}) : {text_preview}")
+                if tentative == 0:
+                    time.sleep(10)
+                    continue
+                send_telegram("⚠️ Bot news-first : le calendrier a renvoyé une page bloquée (rate limit probable) au lieu du JSON. Réessai au prochain run.")
+                return []
+            return resp.json()
+        except Exception as e:
+            print(f"Erreur de récupération du calendrier (tentative {tentative+1}): {e}")
+            if tentative == 0:
+                time.sleep(10)
+                continue
+            send_telegram(f"⚠️ Bot news-first : échec de récupération du calendrier après 2 tentatives ({e}).")
+            return []
+    return []
 
 def classify_event(title):
     t = title.lower()
