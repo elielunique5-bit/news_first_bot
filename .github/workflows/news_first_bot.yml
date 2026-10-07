@@ -30,6 +30,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SEUIL_ALERTE: ${{ vars.SEUIL_ALERTE }}
           ENVOYER_MEME_SANS_ALERTE: ${{ vars.ENVOYER_MEME_SANS_ALERTE }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
          RUN_MODE: ${{ (github.event.schedule == '3 5 * * *' || github.event_name == 'workflow_dispatch') && 'briefing' || 'watch' }}
         run: python news_first_bot.py
 
