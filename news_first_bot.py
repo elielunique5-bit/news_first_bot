@@ -1,32 +1,26 @@
 """
-Bot d'analyse des annonces économiques - Stratégie news-first (v3)
+Bot d'analyse des annonces économiques - Stratégie news-first (v4)
 ====================================================================
-- Fuseau horaire : TOUTES les heures affichées sont converties en
-  heure de Kinshasa (Africa/Kinshasa), quelle que soit la source du feed.
-- SEUIL_ALERTE : lecture protégée (env_int), ne plante plus si la
-  variable GitHub est vide ou absente.
-- Deux modes d'exécution, pilotés par RUN_MODE (fixé par le workflow) :
-    RUN_MODE=briefing -> envoie le récap complet du biais cumulé
-                          (normalement 1x/jour, ~6h Kinshasa)
-    RUN_MODE=watch     -> ne fait QUE vérifier les publications fraîches
-                          (tourne toutes les 15 min, pas de spam)
-- Anti-doublon :
-    - state["alerted"]           -> events déjà notifiés individuellement
-    - state["last_briefing_date"] -> empêche d'envoyer 2 briefings le même jour
-      même si le cron se déclenche deux fois ou qu'on relance manuellement.
+- Source de données : API officielle Finnhub (calendrier économique),
+  à la place du feed gratuit non-officiel qui était sujet au blocage.
+- Messages Telegram en tableaux réels (colonnes alignées, bloc <pre>).
+- Fuseau horaire : tout est converti en heure de Kinshasa.
+- Deux modes : RUN_MODE=briefing (récap quotidien, ~6h) ou
+  RUN_MODE=watch (vérif publications fraîches, toutes les ~15 min).
+- Anti-doublon : alertes individuelles + un seul briefing par jour.
 
-Secrets requis dans le repo GitHub :
+Secrets requis dans le repo GitHub (Settings > Secrets and variables > Actions) :
     TELEGRAM_BOT_TOKEN
     TELEGRAM_CHAT_ID
+    FINNHUB_API_KEY
 
-Variables optionnelles (Settings > Secrets and variables > Actions > Variables) :
+Variables optionnelles (même page, onglet "Variables") :
     SEUIL_ALERTE (def: 5)
     ENVOYER_MEME_SANS_ALERTE (def: true)
 """
 
 import os
 import json
-import time
 import requests
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -36,8 +30,7 @@ from zoneinfo import ZoneInfo
 # CONFIGURATION
 # ---------------------------------------------------------------
 
-TZ = ZoneInfo("Africa/Kinshasa")                    # fuseau d'affichage cible
-SOURCE_TZ_FALLBACK = ZoneInfo("America/New_York")   # fuseau du feed si pas d'offset explicite
+TZ = ZoneInfo("Africa/Kinshasa")
 
 MARKETS = {
     "USD": "New York",
@@ -51,14 +44,20 @@ MARKETS = {
 }
 
 ASSET_MAP = {
-    "USD": ["DXY", "XAUUSD", "indices US", "BTC/ETH (indirect)"],
-    "EUR": ["EURUSD", "DXY (inverse)"],
+    "USD": ["DXY", "XAUUSD", "indices US", "BTC/ETH"],
+    "EUR": ["EURUSD", "DXY(inv)"],
     "GBP": ["GBPUSD", "GBPJPY"],
     "JPY": ["USDJPY", "GBPJPY", "XAUJPY"],
-    "CNY": ["indices asiatiques", "AUDUSD (proxy Chine)"],
-    "HKD": ["indices Hong Kong", "USDHKD"],
+    "CNY": ["indices asia", "AUDUSD"],
+    "HKD": ["indices HK", "USDHKD"],
     "AUD": ["AUDUSD", "AUDJPY"],
-    "CHF": ["USDCHF", "XAUUSD (refuge)"],
+    "CHF": ["USDCHF", "XAUUSD"],
+}
+
+# Finnhub renvoie des codes pays ISO, pas des codes devise
+COUNTRY_TO_CURRENCY = {
+    "US": "USD", "EU": "EUR", "GB": "GBP", "JP": "JPY",
+    "CN": "CNY", "HK": "HKD", "AU": "AUD", "CH": "CHF",
 }
 
 NIVEAU_1_KEYWORDS = [
@@ -73,20 +72,20 @@ NIVEAU_2_KEYWORDS = [
     "speech", "speaks", "housing", "durable goods",
 ]
 
-FOREX_FACTORY_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+FINNHUB_URL = "https://finnhub.io/api/v1/calendar/economic"
 STATE_FILE = "state/sent_events.json"
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 
-RUN_MODE = os.environ.get("RUN_MODE", "briefing").strip().lower()  # "briefing" ou "watch"
+RUN_MODE = os.environ.get("RUN_MODE", "briefing").strip().lower()
 
-PUBLISH_WINDOW_MIN = 20   # tolérance pour détecter "vient de sortir"
-WATCH_HOURS = 36          # fenêtre d'anticipation avant publication
+PUBLISH_WINDOW_MIN = 20
+WATCH_HOURS = 36
 
 
 def env_int(name, default):
-    """Lit une variable d'env entière, en gérant le cas vide/absent (bug corrigé)."""
     val = os.environ.get(name, "")
     if val is None or str(val).strip() == "":
         return default
@@ -108,32 +107,28 @@ ENVOYER_MEME_SANS_ALERTE = env_bool("ENVOYER_MEME_SANS_ALERTE", True)
 
 
 # ---------------------------------------------------------------
-# RÉCUPÉRATION ET PARSING
+# RÉCUPÉRATION (Finnhub) ET PARSING
 # ---------------------------------------------------------------
 
 def fetch_calendar():
-    """Récupère le calendrier, avec 1 retry et détection des blocages (HTML au lieu de JSON)."""
-    for tentative in range(2):
-        try:
-            resp = requests.get(FOREX_FACTORY_URL, timeout=10)
-            resp.raise_for_status()
-            text_preview = resp.text[:200].strip()
-            if text_preview.startswith(("<!DOCTYPE", "<html", "<HTML")):
-                print(f"Réponse non-JSON reçue (tentative {tentative+1}) : {text_preview}")
-                if tentative == 0:
-                    time.sleep(10)
-                    continue
-                send_telegram("⚠️ Bot news-first : le calendrier a renvoyé une page bloquée (rate limit probable) au lieu du JSON. Réessai au prochain run.")
-                return []
-            return resp.json()
-        except Exception as e:
-            print(f"Erreur de récupération du calendrier (tentative {tentative+1}): {e}")
-            if tentative == 0:
-                time.sleep(10)
-                continue
-            send_telegram(f"⚠️ Bot news-first : échec de récupération du calendrier après 2 tentatives ({e}).")
-            return []
-    return []
+    """Récupère le calendrier via l'API officielle Finnhub."""
+    if not FINNHUB_API_KEY:
+        print("FINNHUB_API_KEY manquant.")
+        return []
+    today = datetime.now(TZ).date()
+    params = {
+        "from": (today - timedelta(days=4)).isoformat(),
+        "to": (today + timedelta(days=2)).isoformat(),
+        "token": FINNHUB_API_KEY,
+    }
+    try:
+        resp = requests.get(FINNHUB_URL, params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("economicCalendar", [])
+    except Exception as e:
+        print(f"Erreur de récupération du calendrier (Finnhub): {e}")
+        return []
+
 
 def classify_event(title):
     t = title.lower()
@@ -144,22 +139,7 @@ def classify_event(title):
     return None
 
 
-def parse_datetime(raw_date):
-    """Parse la date du feed et la convertit TOUJOURS en heure Kinshasa."""
-    dt = None
-    try:
-        dt = datetime.strptime(raw_date, "%Y-%m-%dT%H:%M:%S%z")
-    except ValueError:
-        try:
-            dt_naive = datetime.strptime(raw_date, "%Y-%m-%dT%H:%M:%S")
-            dt = dt_naive.replace(tzinfo=SOURCE_TZ_FALLBACK)
-        except ValueError:
-            return None
-    return dt.astimezone(TZ)
-
-
 def parse_num(v):
-    """Nettoie '0.9%', '9.5K', '-100.8B' etc. vers un float."""
     if v is None or v == "":
         return None
     s = str(v).strip().replace("%", "").replace(",", "")
@@ -180,8 +160,9 @@ def parse_events(raw_events):
     parsed = []
     for e in raw_events:
         impact = (e.get("impact") or "").lower()
-        currency = e.get("country", "")
-        title = e.get("title", "")
+        raw_country = e.get("country", "")
+        currency = COUNTRY_TO_CURRENCY.get(raw_country, "")
+        title = e.get("event", "")
 
         if impact != "high":
             continue
@@ -192,42 +173,43 @@ def parse_events(raw_events):
         if niveau is None:
             niveau = 2
 
-        dt = parse_datetime(e.get("date", ""))  # <- toujours en heure Kinshasa
+        dt = None
+        raw_time = e.get("time", "")
+        try:
+            dt_naive = datetime.strptime(raw_time, "%Y-%m-%d %H:%M:%S")
+            dt = dt_naive.replace(tzinfo=ZoneInfo("UTC")).astimezone(TZ)
+        except ValueError:
+            dt = None
 
         parsed.append({
-            "id": f"{currency}_{title}_{e.get('date','')}",
+            "id": f"{currency}_{title}_{raw_time}",
             "titre": title,
             "devise": currency,
             "place": MARKETS.get(currency, "?"),
             "niveau": niveau,
             "datetime": dt,
             "actual": e.get("actual"),
-            "forecast": e.get("forecast"),
-            "previous": e.get("previous"),
+            "forecast": e.get("estimate"),
+            "previous": e.get("prev"),
         })
     return parsed
 
 
 # ---------------------------------------------------------------
-# TABLEAU DE SCÉNARIOS (neutre, sans thèse personnelle)
+# SCÉNARIOS (neutres, pour les colonnes PREV/FCST + alerte publication)
 # ---------------------------------------------------------------
 
 def build_scenario_table(event):
     f, p = parse_num(event["forecast"]), parse_num(event["previous"])
     if f is None or p is None:
         return None
-
     ecart = f - p
     step = abs(ecart) if abs(ecart) > 1e-9 else max(abs(f) * 0.5, 0.1)
     trend_up = ecart >= 0
-
     if trend_up:
-        forte = f + step * 0.5
-        inverse = p - step * 0.3
+        forte, inverse = f + step * 0.5, p - step * 0.3
     else:
-        forte = f - step * 0.5
-        inverse = p + step * 0.3
-
+        forte, inverse = f - step * 0.5, p + step * 0.3
     return {"trend_up": trend_up, "consensus": f, "forte": forte, "inverse": inverse}
 
 
@@ -246,17 +228,6 @@ def classify_actual(event, table):
     return "Entre consensus et confirmation"
 
 
-def format_scenario_table(table, unite=""):
-    if table is None:
-        return "  (pas de scénario chiffré disponible pour cet event)"
-    fleche = "↑" if table["trend_up"] else "↓"
-    return "\n".join([
-        f"  1) Conforme au consensus     : ~{table['consensus']:.2f}{unite}",
-        f"  2) Confirmation forte {fleche}      : au-delà de {table['forte']:.2f}{unite}",
-        f"  3) Surprise inverse           : retour vers/au-delà de {table['inverse']:.2f}{unite}",
-    ])
-
-
 # ---------------------------------------------------------------
 # ANALYSE GLOBALE (score de biais cumulé)
 # ---------------------------------------------------------------
@@ -264,32 +235,29 @@ def format_scenario_table(table, unite=""):
 def determine_direction(event):
     a, f = parse_num(event.get("actual")), parse_num(event.get("forecast"))
     if a is None or f is None:
-        return "en attente de publication"
+        return "attente"
     if a > f:
-        return "au-dessus des attentes"
+        return "au-dessus"
     elif a < f:
-        return "en-dessous des attentes"
-    return "conforme aux attentes"
+        return "en-dessous"
+    return "conforme"
 
 
 def build_bias_score(events, days_window=4):
     now = datetime.now(TZ)
     cutoff = now - timedelta(days=days_window)
-
     scores = defaultdict(int)
     details = defaultdict(list)
-
     for e in events:
         if e["datetime"] is None or not (cutoff <= e["datetime"] <= now):
             continue
         weight = 3 if e["niveau"] == 1 else 1
         direction = determine_direction(e)
-        if direction == "au-dessus des attentes":
+        if direction == "au-dessus":
             scores[e["devise"]] += weight
-        elif direction == "en-dessous des attentes":
+        elif direction == "en-dessous":
             scores[e["devise"]] -= weight
         details[e["devise"]].append((e["titre"], direction, e["niveau"]))
-
     return scores, details
 
 
@@ -302,7 +270,6 @@ def upcoming_events(events, hours_ahead=WATCH_HOURS):
 
 
 def just_published(events, state, window_min=PUBLISH_WINDOW_MIN):
-    """Events dont l'actual est rempli, pas encore alertés."""
     now = datetime.now(TZ)
     fresh = []
     for e in events:
@@ -317,7 +284,7 @@ def just_published(events, state, window_min=PUBLISH_WINDOW_MIN):
 
 
 # ---------------------------------------------------------------
-# ÉTAT (anti-doublon : publications individuelles + briefing quotidien)
+# ÉTAT
 # ---------------------------------------------------------------
 
 def load_state():
@@ -333,6 +300,37 @@ def save_state(state):
     state["alerted"] = state.get("alerted", [])[-300:]
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
+
+
+# ---------------------------------------------------------------
+# OUTILS TABLEAU (texte aligné, affiché dans <pre> sur Telegram)
+# ---------------------------------------------------------------
+
+def esc(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def pad(val, width, right=False):
+    s = str(val) if val not in (None, "") else "-"
+    if len(s) > width:
+        s = s[:width - 1] + "…"
+    return s.rjust(width) if right else s.ljust(width)
+
+
+def fmt_num(v):
+    if v is None or v == "":
+        return "-"
+    return str(v)
+
+
+def make_table(headers, rows, widths, rights=None):
+    rights = rights or [False] * len(headers)
+    header_line = " ".join(pad(h, w) for h, w in zip(headers, widths))
+    sep = "-" * len(header_line)
+    lines = [header_line, sep]
+    for row in rows:
+        lines.append(" ".join(pad(c, w, r) for c, w, r in zip(row, widths, rights)))
+    return esc("\n".join(lines))
 
 
 # ---------------------------------------------------------------
@@ -360,15 +358,24 @@ def build_publication_alert(event):
     table = build_scenario_table(event)
     resultat = classify_actual(event, table)
 
-    lines = [f"🔔 <b>PUBLICATION — {event['titre']} ({event['devise']})</b>"]
-    lines.append(f"Heure: {event['datetime'].strftime('%a %d/%m %Hh%M')} (Kinshasa)")
-    lines.append(f"Actual: {event.get('actual','n/a')} | Forecast: {event.get('forecast','n/a')} | Previous: {event.get('previous','n/a')}")
-    lines.append("")
-    lines.append("<b>Scénarios (référence, calculés avant publication)</b>")
-    lines.append(format_scenario_table(table))
+    rows = [
+        ["Actual", fmt_num(event.get("actual"))],
+        ["Forecast", fmt_num(event.get("forecast"))],
+        ["Previous", fmt_num(event.get("previous"))],
+    ]
+    if table:
+        rows.append(["Conforme", f"~{table['consensus']:.2f}"])
+        rows.append(["Confirm. forte", f"{'>' if table['trend_up'] else '<'}{table['forte']:.2f}"])
+        rows.append(["Surprise inv.", f"{'<' if table['trend_up'] else '>'}{table['inverse']:.2f}"])
+
+    tbl = make_table(["CHAMP", "VALEUR"], rows, [15, 12], [False, True])
+
+    lines = [f"🔔 <b>PUBLICATION — {esc(event['titre'])} ({event['devise']})</b>"]
+    lines.append(f"{event['datetime'].strftime('%a %d/%m %Hh%M')} (Kinshasa)")
+    lines.append(f"<pre>{tbl}</pre>")
     if resultat:
-        lines.append(f"\n<b>→ Scénario réalisé : {resultat}</b>")
-    lines.append(f"\n<b>Actifs ciblés :</b> {', '.join(ASSET_MAP.get(event['devise'], ['-']))}")
+        lines.append(f"<b>→ {esc(resultat)}</b>")
+    lines.append(f"<b>Actifs :</b> {esc(', '.join(ASSET_MAP.get(event['devise'], ['-'])))}")
     return "\n".join(lines)
 
 
@@ -378,37 +385,55 @@ def build_daily_briefing(events):
     faibles = {d: s for d, s in scores.items() if abs(s) < SEUIL_ALERTE}
 
     lines = []
+
     if fortes:
-        lines.append(f"<b>🔴 BIAIS FORT (seuil {SEUIL_ALERTE} dépassé)</b>")
+        rows = []
         for devise, score in sorted(fortes.items(), key=lambda x: -abs(x[1])):
             tendance = "HAUSSIER" if score > 0 else "BAISSIER"
-            lines.append(f"\n<b>{devise}</b> ({MARKETS.get(devise)}) — score {score:+d} → {tendance} CONFIRMÉ")
-            lines.append(f"Actifs: {', '.join(ASSET_MAP.get(devise, ['-']))}")
-            for titre, direction, niveau in details[devise]:
-                lines.append(f"  [N{niveau}] {titre} → {direction}")
+            rows.append([devise, f"{score:+d}", tendance])
+        tbl = make_table(["DEV", "SCORE", "TENDANCE"], rows, [4, 6, 9], [False, True, False])
+        lines.append(f"🔴 <b>BIAIS FORT (seuil {SEUIL_ALERTE})</b>")
+        lines.append(f"<pre>{tbl}</pre>")
+        for devise in fortes:
+            actifs = ", ".join(ASSET_MAP.get(devise, ["-"]))
+            lines.append(f"<b>{devise}</b> → {esc(actifs)}")
     else:
-        lines.append(f"<b>Aucun biais n'a dépassé le seuil ({SEUIL_ALERTE}) sur les 4 derniers jours.</b>")
-        lines.append("Pas de conviction suffisante pour trader sur base du narratif — patience.")
+        lines.append(f"<b>Aucun biais au-delà du seuil ({SEUIL_ALERTE}) sur 4 jours.</b>")
+        lines.append("Patience — pas de conviction suffisante.")
 
     if faibles:
-        lines.append(f"\n<b>Biais sous le seuil (à surveiller)</b>")
+        rows = []
         for devise, score in sorted(faibles.items(), key=lambda x: -abs(x[1])):
             tendance = "haussier" if score > 0 else "baissier" if score < 0 else "neutre"
-            lines.append(f"  {devise}: {score:+d} ({tendance})")
+            rows.append([devise, f"{score:+d}", tendance])
+        tbl = make_table(["DEV", "SCORE", "TEND."], rows, [4, 6, 9], [False, True, False])
+        lines.append("\n<b>Sous le seuil (à surveiller)</b>")
+        lines.append(f"<pre>{tbl}</pre>")
 
-    lines.append(f"\n<b>À VENIR — prochaines {WATCH_HOURS}h (heure Kinshasa)</b>")
+    lines.append(f"\n<b>À VENIR — {WATCH_HOURS}h (Kinshasa)</b>")
     up = upcoming_events(events)
     if not up:
-        lines.append("Rien de prévu à fort impact, pas encore publié.")
+        lines.append("Rien de prévu, pas encore publié.")
     else:
+        rows = []
+        devises_vues = []
         for e in up:
-            table = build_scenario_table(e)
-            date_str = e["datetime"].strftime("%a %d/%m %Hh%M")
-            marqueur = " ⚠ devise déjà en biais fort" if e["devise"] in fortes else ""
-            lines.append(f"\n[N{e['niveau']}] {e['titre']} ({e['devise']} - {e['place']}){marqueur}")
-            lines.append(f"Prévu: {date_str} | Forecast: {e.get('forecast','n/a')} | Previous: {e.get('previous','n/a')}")
-            lines.append(format_scenario_table(table))
-            lines.append(f"Actifs à surveiller: {', '.join(ASSET_MAP.get(e['devise'], ['-']))}")
+            date_str = e["datetime"].strftime("%d/%m %Hh%M")
+            rows.append([
+                f"N{e['niveau']}", e["devise"], e["titre"],
+                date_str, fmt_num(e.get("previous")), fmt_num(e.get("forecast")),
+            ])
+            if e["devise"] not in devises_vues:
+                devises_vues.append(e["devise"])
+        tbl = make_table(
+            ["N", "DEV", "ÉVÉNEMENT", "QUAND", "PREV", "FCST"],
+            rows, [2, 4, 18, 11, 7, 7], [False, False, False, False, True, True],
+        )
+        lines.append(f"<pre>{tbl}</pre>")
+        lines.append("<b>Actifs à surveiller :</b>")
+        for devise in devises_vues:
+            actifs = ", ".join(ASSET_MAP.get(devise, ["-"]))
+            lines.append(f"  {devise} → {esc(actifs)}")
 
     return "\n".join(lines)
 
@@ -419,11 +444,11 @@ def build_daily_briefing(events):
 
 def main():
     print(f"Mode d'exécution : {RUN_MODE}")
-    print("Récupération du calendrier économique...")
+    print("Récupération du calendrier économique (Finnhub)...")
     raw = fetch_calendar()
     if not raw:
         if RUN_MODE == "briefing":
-            send_telegram("Bot news-first: impossible de récupérer le calendrier aujourd'hui.")
+            send_telegram("Bot news-first : impossible de récupérer le calendrier aujourd'hui (Finnhub).")
         return
 
     events = parse_events(raw)
@@ -439,7 +464,7 @@ def main():
     if RUN_MODE == "briefing":
         today_str = datetime.now(TZ).strftime("%Y-%m-%d")
         if state.get("last_briefing_date") == today_str:
-            print("Briefing déjà envoyé aujourd'hui — on ne renvoie pas de doublon.")
+            print("Briefing déjà envoyé aujourd'hui.")
         else:
             briefing = build_daily_briefing(events)
             print(briefing)
@@ -447,7 +472,7 @@ def main():
                 send_telegram(briefing)
             state["last_briefing_date"] = today_str
     else:
-        print("Mode watch : pas de briefing complet, uniquement les publications fraîches ci-dessus.")
+        print("Mode watch : pas de briefing complet.")
 
     save_state(state)
 
